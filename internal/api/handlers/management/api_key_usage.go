@@ -6,13 +6,22 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coresession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
 )
 
 type apiKeyUsageEntry struct {
 	Success        int64                          `json:"success"`
 	Failed         int64                          `json:"failed"`
 	RecentRequests []coreauth.RecentRequestBucket `json:"recent_requests"`
+}
+
+type apiKeyAuthOccupancyEntry struct {
+	APIKey      string                         `json:"api-key"`
+	Alias       string                         `json:"alias,omitempty"`
+	Credentials []coreauth.CallerAuthOccupancy `json:"credentials"`
 }
 
 func mergeRecentRequestBuckets(dst, src []coreauth.RecentRequestBucket) []coreauth.RecentRequestBucket {
@@ -114,4 +123,65 @@ func (h *Handler) GetAPIKeyUsage(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, out)
+}
+
+// GetAPIKeyAuthOccupancy returns auth file credentials claimed by enabled downstream API keys.
+func (h *Handler) GetAPIKeyAuthOccupancy(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+
+	h.mu.Lock()
+	cfg := h.cfg
+	manager := h.authManager
+	var entries []config.APIKeyEntry
+	if cfg != nil {
+		entries = cfg.AccessAPIKeyEntries()
+	}
+	h.mu.Unlock()
+	if manager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	type itemWithScope struct {
+		scope string
+		item  apiKeyAuthOccupancyEntry
+	}
+	items := make([]itemWithScope, 0, len(entries))
+	scopes := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Disabled {
+			continue
+		}
+		key := strings.TrimSpace(entry.APIKey)
+		if key == "" {
+			continue
+		}
+		scope := coresession.CallerScope(key)
+		if scope == "" {
+			continue
+		}
+		scopes = append(scopes, scope)
+		items = append(items, itemWithScope{
+			scope: scope,
+			item: apiKeyAuthOccupancyEntry{
+				APIKey: util.HideAPIKey(key),
+				Alias:  strings.TrimSpace(entry.Alias),
+			},
+		})
+	}
+
+	occupancy := manager.CallerAuthOccupancySnapshot(scopes)
+	out := make([]apiKeyAuthOccupancyEntry, 0, len(items))
+	for _, entry := range items {
+		entry.item.Credentials = occupancy[entry.scope]
+		if entry.item.Credentials == nil {
+			entry.item.Credentials = []coreauth.CallerAuthOccupancy{}
+		}
+		out = append(out, entry.item)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"items": out})
 }

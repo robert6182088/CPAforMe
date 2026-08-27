@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/credentialweight"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -112,6 +113,160 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
+}
+
+// PatchAuthFilesStatus toggles the disabled state of multiple auth files.
+func (h *Handler) PatchAuthFilesStatus(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		Names []string `json:"names"`
+		Items []struct {
+			Name      string `json:"name"`
+			AuthIndex string `json:"auth_index"`
+		} `json:"items"`
+		Disabled *bool `json:"disabled"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	if req.Disabled == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "disabled is required"})
+		return
+	}
+
+	type target struct {
+		Name      string
+		AuthIndex string
+	}
+	targets := make([]target, 0, len(req.Names)+len(req.Items))
+	seen := make(map[string]struct{}, len(req.Names)+len(req.Items))
+	for _, name := range req.Names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		key := name + "\x00"
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		targets = append(targets, target{Name: name})
+	}
+	for _, item := range req.Items {
+		name := strings.TrimSpace(item.Name)
+		authIndex := strings.TrimSpace(item.AuthIndex)
+		if name == "" {
+			continue
+		}
+		key := name + "\x00" + authIndex
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		targets = append(targets, target{Name: name, AuthIndex: authIndex})
+	}
+	if len(targets) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "names are required"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	results := make([]gin.H, 0, len(targets))
+	success := 0
+	for _, item := range targets {
+		disabled, status, errPatch := h.patchAuthFileStatusTarget(ctx, item.Name, item.AuthIndex, *req.Disabled)
+		result := gin.H{"name": item.Name, "disabled": disabled}
+		if item.AuthIndex != "" {
+			result["auth_index"] = item.AuthIndex
+		}
+		if errPatch != nil {
+			result["status"] = "error"
+			result["error"] = errPatch.Error()
+			result["code"] = status
+			results = append(results, result)
+			continue
+		}
+		result["status"] = "ok"
+		results = append(results, result)
+		success++
+	}
+
+	statusCode := http.StatusOK
+	if success == 0 {
+		statusCode = http.StatusMultiStatus
+	} else if success != len(targets) {
+		statusCode = http.StatusMultiStatus
+	}
+	c.JSON(statusCode, gin.H{
+		"status":   map[bool]string{true: "ok", false: "partial"}[success == len(targets)],
+		"updated":  success,
+		"failed":   len(targets) - success,
+		"disabled": *req.Disabled,
+		"results":  results,
+	})
+}
+
+func (h *Handler) patchAuthFileStatusTarget(ctx context.Context, name string, authIndex string, disabled bool) (bool, int, error) {
+	name = strings.TrimSpace(name)
+	authIndex = strings.TrimSpace(authIndex)
+	if name == "" {
+		return disabled, http.StatusBadRequest, fmt.Errorf("name is required")
+	}
+
+	targetAuth, _ := h.lookupAuthFile(name, authIndex)
+	if targetAuth == nil {
+		return disabled, http.StatusNotFound, fmt.Errorf("auth file not found")
+	}
+	if coreauth.IsPluginVirtualAuth(targetAuth) {
+		if !isPluginVirtualSourceDelete(name, targetAuth) {
+			return disabled, http.StatusConflict, errPluginVirtualAuth
+		}
+		if errPatch := h.patchPluginVirtualSourceStatus(ctx, targetAuth, disabled); errPatch != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(errPatch, errAuthFileNotFound) || os.IsNotExist(errPatch) {
+				status = http.StatusNotFound
+			}
+			return disabled, status, errPatch
+		}
+		return disabled, http.StatusOK, nil
+	}
+
+	if coreauth.IsConfigAPIKeyAuth(targetAuth) {
+		h.mu.Lock()
+		handled, errToggle := toggleConfigAPIKeyExcludedAll(h.cfg, targetAuth, disabled)
+		if errToggle != nil {
+			h.mu.Unlock()
+			return disabled, http.StatusInternalServerError, fmt.Errorf("failed to update config api key: %w", errToggle)
+		}
+		if !handled {
+			h.mu.Unlock()
+			return disabled, http.StatusNotFound, fmt.Errorf("config api key entry not found")
+		}
+		if h.configFilePath != "" {
+			if errSave := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); errSave != nil {
+				h.mu.Unlock()
+				return disabled, http.StatusInternalServerError, errSave
+			}
+		}
+		cfgSnapshot := h.reloadSnapshotConfigLocked()
+		h.mu.Unlock()
+		h.reloadConfigAfterManagementSave(ctx, cfgSnapshot)
+		if h.tokenStore != nil {
+			_ = h.tokenStore.Delete(ctx, targetAuth.ID)
+		}
+		return disabled, http.StatusOK, nil
+	}
+
+	applyAuthDisabledState(targetAuth, disabled)
+	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+		return disabled, http.StatusInternalServerError, fmt.Errorf("failed to update auth: %w", err)
+	}
+	return disabled, http.StatusOK, nil
 }
 
 // patchPluginVirtualSourceStatus toggles disabled on a plugin multi-auth source file and all

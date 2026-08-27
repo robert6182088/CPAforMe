@@ -48,8 +48,12 @@ type SDKConfig struct {
 	// ClaudeCode configures Claude Code compatibility behavior.
 	ClaudeCode ClaudeCodeConfig `yaml:"claude-code" json:"claude-code"`
 
-	// APIKeys is a list of keys for authenticating clients to this proxy server.
+	// APIKeys is the legacy list of keys for authenticating clients to this proxy server.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
+
+	// APIKeyEntries is the structured client API key list with optional operator metadata.
+	// When set, it is used as the source of truth for request authentication.
+	APIKeyEntries []APIKeyEntry `yaml:"api-key-entries,omitempty" json:"api-key-entries,omitempty"`
 
 	// PassthroughHeaders controls whether upstream response headers are forwarded to downstream clients.
 	// Default is false (disabled).
@@ -61,6 +65,18 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+}
+
+// APIKeyEntry describes a client API key accepted by this proxy server.
+type APIKeyEntry struct {
+	// APIKey is the secret value clients send to authenticate with the proxy.
+	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// Alias is a human-readable name shown by management clients.
+	Alias string `yaml:"alias,omitempty" json:"alias,omitempty"`
+
+	// Disabled prevents this key from authenticating requests.
+	Disabled bool `yaml:"disabled,omitempty" json:"disabled,omitempty"`
 }
 
 // ClaudeCodeConfig configures Claude Code compatibility behavior.

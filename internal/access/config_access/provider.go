@@ -16,31 +16,40 @@ func Register(cfg *sdkconfig.SDKConfig) {
 		return
 	}
 
-	keys := normalizeKeys(cfg.APIKeys)
-	if len(keys) == 0 {
+	entries := cfg.AccessAPIKeyEntries()
+	if len(entries) == 0 {
 		sdkaccess.UnregisterProvider(sdkaccess.AccessProviderTypeConfigAPIKey)
 		return
 	}
 
 	sdkaccess.RegisterProvider(
 		sdkaccess.AccessProviderTypeConfigAPIKey,
-		newProvider(sdkaccess.DefaultAccessProviderName, keys),
+		newProvider(sdkaccess.DefaultAccessProviderName, entries),
 	)
+}
+
+type keyEntry struct {
+	alias string
 }
 
 type provider struct {
 	name string
-	keys map[string]struct{}
+	keys map[string]keyEntry
 }
 
-func newProvider(name string, keys []string) *provider {
+func newProvider(name string, entries []sdkconfig.APIKeyEntry) *provider {
 	providerName := strings.TrimSpace(name)
 	if providerName == "" {
 		providerName = sdkaccess.DefaultAccessProviderName
 	}
-	keySet := make(map[string]struct{}, len(keys))
-	for _, key := range keys {
-		keySet[key] = struct{}{}
+	cfg := sdkconfig.SDKConfig{APIKeyEntries: entries}
+	normalized := cfg.AccessAPIKeyEntries()
+	keySet := make(map[string]keyEntry, len(normalized))
+	for _, entry := range normalized {
+		if entry.Disabled {
+			continue
+		}
+		keySet[entry.APIKey] = keyEntry{alias: strings.TrimSpace(entry.Alias)}
 	}
 	return &provider{name: providerName, keys: keySet}
 }
@@ -89,13 +98,18 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 		if candidate.value == "" {
 			continue
 		}
-		if _, ok := p.keys[candidate.value]; ok {
+		entry, ok := p.keys[candidate.value]
+		if ok {
+			metadata := map[string]string{
+				"source": candidate.source,
+			}
+			if entry.alias != "" {
+				metadata["alias"] = entry.alias
+			}
 			return &sdkaccess.Result{
 				Provider:  p.Identifier(),
 				Principal: candidate.value,
-				Metadata: map[string]string{
-					"source": candidate.source,
-				},
+				Metadata:  metadata,
 			}, nil
 		}
 	}
@@ -115,27 +129,4 @@ func extractBearerToken(header string) string {
 		return header
 	}
 	return strings.TrimSpace(parts[1])
-}
-
-func normalizeKeys(keys []string) []string {
-	if len(keys) == 0 {
-		return nil
-	}
-	normalized := make([]string, 0, len(keys))
-	seen := make(map[string]struct{}, len(keys))
-	for _, key := range keys {
-		trimmedKey := strings.TrimSpace(key)
-		if trimmedKey == "" {
-			continue
-		}
-		if _, exists := seen[trimmedKey]; exists {
-			continue
-		}
-		seen[trimmedKey] = struct{}{}
-		normalized = append(normalized, trimmedKey)
-	}
-	if len(normalized) == 0 {
-		return nil
-	}
-	return normalized
 }

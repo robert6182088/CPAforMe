@@ -147,6 +147,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		return nil, errResolvePluginsDir
 	}
 
+	// Sanitize client API key configuration.
+	cfg.SanitizeAccessAPIKeys()
+
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
 

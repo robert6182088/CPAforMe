@@ -1,0 +1,54 @@
+host: "127.0.0.1"
+port: 8317
+tls:
+  enable: false
+  cert: ""
+  key: ""
+remote-management:
+  allow-remote: false
+  secret-key: "$2a$10$p1KfAuNI8gMICnimWrhDverii7uj1fPQmaTYqvTiXyi6yap66c5qK"
+  disable-control-panel: false
+  panel-github-repository: "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+auth-dir: "C:\\Users\\Administrator\\.cli-proxy-api"
+api-key-entries:
+  - api-key: sk-cACe25fpL3c7dIDtS7y0zcgp1rOOe14k9pXhROeXHKVFNIaU
+    alias: 张三
+  - api-key: sk-W0JjF2mXJNJzNOcLE498wL155zYqKRkBq42qWJFtLy1Prkdn
+    alias: 李四
+  - api-key: sk-UEFyizdIs7fNaaICUNwo2rmW3vTKKBdPyJMuob4yi0ng4kDG
+    alias: 王五
+debug: true
+pprof:
+  enable: false
+  addr: "127.0.0.1:8316"
+plugins:
+  enabled: false
+  dir: "plugins"
+  configs: {}
+logging-to-file: false
+usage-statistics-enabled: false
+credential-concurrency:
+  cpa-heartbeat-timeout: 3s
+  cpa-cancel-bound: 5s
+  reclaim-grace: 5s
+  cleanup-interval: 5s
+  release-flush-interval: 250ms
+  release-max-backoff: 2s
+  busy-retry-min: 250ms
+  busy-retry-max: 1s
+  max-limit: 1000000
+credential-in-flight:
+  snapshot-interval: 2s
+  stale-after: 10s
+  max-part-bytes: 262144
+  max-part-count: 64
+  max-revision-bytes: 16777216
+  max-aggregate-groups: 100000
+  max-details: 10000
+  max-string-bytes: 256
+  staging-retention: 1m
+redis-usage-queue-retention-seconds: 60
+ws-auth: true
+routing:
+  strategy: fill-first
+proxy-url: http://127.0.0.1:7892

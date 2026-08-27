@@ -41,6 +41,16 @@ api-keys:
   - "your-api-key-2"
   - "your-api-key-3"
 
+# Optional structured API key entries for the management panel.
+# When configured, this list is used as the source of truth for request authentication.
+# api-key-entries:
+#   - api-key: "your-api-key-1"
+#     alias: "Main workstation"
+#     disabled: false
+#   - api-key: "your-api-key-2"
+#     alias: "Paused client"
+#     disabled: true
+
 # Enable debug logging
 debug: false
 

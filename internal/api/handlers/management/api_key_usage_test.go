@@ -3,14 +3,47 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coresession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
 )
+
+type apiKeyUsageTestExecutor struct{}
+
+func (apiKeyUsageTestExecutor) Identifier() string {
+	return "codex"
+}
+
+func (apiKeyUsageTestExecutor) Execute(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (apiKeyUsageTestExecutor) ExecuteStream(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (apiKeyUsageTestExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (apiKeyUsageTestExecutor) CountTokens(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (apiKeyUsageTestExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader("{}")),
+	}, nil
+}
 
 func sumRecentRequestBuckets(buckets []coreauth.RecentRequestBucket) (int64, int64) {
 	var success int64
@@ -138,5 +171,71 @@ func TestGetAPIKeyUsage_GroupsOpenAICompatibleByCompatName(t *testing.T) {
 	vastEntry := vastBucket["https://www.vastnum.com/v1|vast-key"]
 	if vastEntry.Success != 1 || vastEntry.Failed != 0 {
 		t.Fatalf("vast totals = %d/%d, want 1/0", vastEntry.Success, vastEntry.Failed)
+	}
+}
+
+func TestGetAPIKeyAuthOccupancy_ReturnsEnabledAPIKeyClaims(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
+	manager.RegisterExecutor(apiKeyUsageTestExecutor{})
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "codex-auth",
+		Provider: "codex",
+		FileName: "codex-user.json",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"access_token": "token",
+			"email":        "codex-user@example.com",
+		},
+	}); err != nil {
+		t.Fatalf("register codex auth: %v", err)
+	}
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{
+			APIKeyEntries: []config.APIKeyEntry{
+				{APIKey: "sk-zhangsan", Alias: "张三"},
+				{APIKey: "sk-lisi", Alias: "李四", Disabled: true},
+			},
+		},
+		AuthDir: t.TempDir(),
+	}
+	if _, err := manager.SelectAuth(context.Background(), "codex", "", cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.CallerScopeMetadataKey: coresession.CallerScope("sk-zhangsan"),
+		},
+	}); err != nil {
+		t.Fatalf("SelectAuth() error = %v", err)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+	rec := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(rec)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/api-key-auth-occupancy", nil)
+	h.GetAPIKeyAuthOccupancy(ginCtx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var payload struct {
+		Items []apiKeyAuthOccupancyEntry `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if len(payload.Items) != 1 {
+		t.Fatalf("items len = %d, want 1: %#v", len(payload.Items), payload.Items)
+	}
+	if got := payload.Items[0].Alias; got != "张三" {
+		t.Fatalf("alias = %q, want 张三", got)
+	}
+	if len(payload.Items[0].Credentials) != 1 {
+		t.Fatalf("credentials len = %d, want 1: %#v", len(payload.Items[0].Credentials), payload.Items[0].Credentials)
+	}
+	credential := payload.Items[0].Credentials[0]
+	if credential.Name != "codex-user.json" || credential.Account != "codex-user@example.com" || credential.Status != coreauth.StatusActive {
+		t.Fatalf("credential = %#v, want codex-user.json/codex-user@example.com/active", credential)
 	}
 }

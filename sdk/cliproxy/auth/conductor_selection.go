@@ -58,6 +58,7 @@ type authSelectionEligibility struct {
 	requiredKind     string
 	credentialPolicy string
 	disallowFreeAuth bool
+	callerScope      string
 }
 
 func withRequiredAuthKind(ctx context.Context, requiredKind string) context.Context {
@@ -77,7 +78,10 @@ func credentialPolicyFromContext(ctx context.Context) string {
 }
 
 func authSelectionEligibilityForRequest(ctx context.Context, opts cliproxyexecutor.Options) authSelectionEligibility {
-	eligibility := authSelectionEligibility{disallowFreeAuth: disallowFreeAuthFromMetadata(opts.Metadata)}
+	eligibility := authSelectionEligibility{
+		disallowFreeAuth: disallowFreeAuthFromMetadata(opts.Metadata),
+		callerScope:      callerScopeFromMetadata(opts.Metadata),
+	}
 	if ctx != nil {
 		eligibility.requiredKind, _ = ctx.Value(requiredAuthKindContextKey{}).(string)
 		eligibility.credentialPolicy, _ = ctx.Value(credentialPolicyContextKey{}).(string)
@@ -1233,6 +1237,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
+	tried = m.withCallerExclusiveTried(opts, tried)
 
 	m.mu.RLock()
 	selector := m.selector
@@ -1260,6 +1265,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 			continue
 		}
 		if !eligibility.allows(candidate) {
+			continue
+		}
+		if !m.authAllowedForCallerLocked(candidate, eligibility.callerScope) {
 			continue
 		}
 		if _, used := tried[candidate.ID]; used {
@@ -1300,6 +1308,13 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	if selected == nil {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+	}
+	if !m.claimAuthForCaller(selected, opts) {
+		if tried == nil {
+			tried = make(map[string]struct{})
+		}
+		tried[selected.ID] = struct{}{}
+		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	authCopy := selected.Clone()
 	if !selected.indexAssigned {
@@ -1486,6 +1501,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	}
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
+	tried = m.withCallerExclusiveTried(opts, tried)
 
 	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
@@ -1498,6 +1514,9 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 				continue
 			}
 			if !eligibility.allows(candidate) {
+				continue
+			}
+			if !m.authAllowedForCallerLocked(candidate, eligibility.callerScope) {
 				continue
 			}
 			if _, used := tried[candidate.ID]; used {
@@ -1526,6 +1545,13 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	if selected == nil {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
+	if !m.claimAuthForCaller(selected, opts) {
+		if tried == nil {
+			tried = make(map[string]struct{})
+		}
+		tried[selected.ID] = struct{}{}
+		return m.pickNext(ctx, provider, model, opts, tried)
+	}
 	authCopy := selected.Clone()
 	if !selected.indexAssigned {
 		m.mu.Lock()
@@ -1549,6 +1575,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
+	tried = m.withCallerExclusiveTried(opts, tried)
 
 	providerSet := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
@@ -1583,6 +1610,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			continue
 		}
 		if !eligibility.allows(candidate) {
+			continue
+		}
+		if !m.authAllowedForCallerLocked(candidate, eligibility.callerScope) {
 			continue
 		}
 		providerKey := executorKeyFromAuth(candidate)
@@ -1634,6 +1664,13 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	if selected == nil {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
+	if !m.claimAuthForCaller(selected, opts) {
+		if tried == nil {
+			tried = make(map[string]struct{})
+		}
+		tried[selected.ID] = struct{}{}
+		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+	}
 	providerKey := executorKeyFromAuth(selected)
 	executor, okExecutor := m.Executor(providerKey)
 	if !okExecutor {
@@ -1658,6 +1695,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	}
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "mixed"
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
+	tried = m.withCallerExclusiveTried(opts, tried)
 
 	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
@@ -1699,6 +1737,9 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			if !eligibility.allows(candidate) {
 				continue
 			}
+			if !m.authAllowedForCallerLocked(candidate, eligibility.callerScope) {
+				continue
+			}
 			if _, used := tried[candidate.ID]; used {
 				continue
 			}
@@ -1721,6 +1762,13 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	}
 	if selected == nil {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+	}
+	if !m.claimAuthForCaller(selected, opts) {
+		if tried == nil {
+			tried = make(map[string]struct{})
+		}
+		tried[selected.ID] = struct{}{}
+		return m.pickNextMixed(ctx, providers, model, opts, tried)
 	}
 	executor, okExecutor := m.Executor(providerKey)
 	if !okExecutor {

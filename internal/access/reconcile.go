@@ -35,16 +35,6 @@ func ReconcileProviders(oldCfg, newCfg *config.Config, existing []sdkaccess.Prov
 
 	finalIDs := make(map[string]struct{}, len(result))
 
-	isInlineProvider := func(id string) bool {
-		return strings.EqualFold(id, sdkaccess.DefaultAccessProviderName)
-	}
-	appendChange := func(list *[]string, id string) {
-		if isInlineProvider(id) {
-			return
-		}
-		*list = append(*list, id)
-	}
-
 	for _, provider := range result {
 		providerID := identifierFromProvider(provider)
 		if providerID == "" {
@@ -54,11 +44,11 @@ func ReconcileProviders(oldCfg, newCfg *config.Config, existing []sdkaccess.Prov
 
 		existingProvider, exists := existingMap[providerID]
 		if !exists {
-			appendChange(&added, providerID)
+			added = append(added, providerID)
 			continue
 		}
 		if !providerInstanceEqual(existingProvider, provider) {
-			appendChange(&updated, providerID)
+			updated = append(updated, providerID)
 		}
 	}
 
@@ -66,7 +56,7 @@ func ReconcileProviders(oldCfg, newCfg *config.Config, existing []sdkaccess.Prov
 		if _, exists := finalIDs[providerID]; exists {
 			continue
 		}
-		appendChange(&removed, providerID)
+		removed = append(removed, providerID)
 	}
 
 	sort.Strings(added)
@@ -121,7 +111,9 @@ func providerInstanceEqual(a, b sdkaccess.Provider) bool {
 	valueA := reflect.ValueOf(a)
 	valueB := reflect.ValueOf(b)
 	if valueA.Kind() == reflect.Pointer && valueB.Kind() == reflect.Pointer {
-		return valueA.Pointer() == valueB.Pointer()
+		if valueA.Pointer() == valueB.Pointer() {
+			return true
+		}
 	}
 	return reflect.DeepEqual(a, b)
 }

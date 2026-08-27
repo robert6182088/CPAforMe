@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -76,6 +77,96 @@ func TestListAuthFilesFiltersByNameAndAuthIndex(t *testing.T) {
 	}
 }
 
+func TestListAuthFilesPaginatesAndFiltersByImportTimeAndStatus(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	records := []struct {
+		id        string
+		fileName  string
+		createdAt time.Time
+		disabled  bool
+	}{
+		{id: "auth-a", fileName: "alpha.json", createdAt: time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)},
+		{id: "auth-b", fileName: "beta.json", createdAt: time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC), disabled: true},
+		{id: "auth-c", fileName: "gamma.json", createdAt: time.Date(2026, 1, 3, 10, 0, 0, 0, time.UTC)},
+	}
+	for _, record := range records {
+		filePath := filepath.Join(authDir, record.fileName)
+		if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+			t.Fatalf("failed to write auth file: %v", errWrite)
+		}
+		status := coreauth.StatusActive
+		if record.disabled {
+			status = coreauth.StatusDisabled
+		}
+		registerAuthForLookupTest(t, manager, &coreauth.Auth{
+			ID:        record.id,
+			FileName:  record.fileName,
+			Provider:  "codex",
+			Status:    status,
+			Disabled:  record.disabled,
+			CreatedAt: record.createdAt,
+			Attributes: map[string]string{
+				"path": filePath,
+			},
+		})
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files?limit=1&offset=1", nil)
+
+	h.ListAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var payload struct {
+		Files      []map[string]any `json:"files"`
+		Total      int              `json:"total"`
+		Limit      int              `json:"limit"`
+		Offset     int              `json:"offset"`
+		HasMore    bool             `json:"has_more"`
+		NextOffset int              `json:"next_offset"`
+	}
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if payload.Total != 3 || payload.Limit != 1 || payload.Offset != 1 || !payload.HasMore || payload.NextOffset != 2 {
+		t.Fatalf("pagination payload = %#v, want total=3 limit=1 offset=1 has_more next=2", payload)
+	}
+	if len(payload.Files) != 1 || payload.Files[0]["name"] != "beta.json" {
+		t.Fatalf("files = %#v, want beta page", payload.Files)
+	}
+
+	rec = httptest.NewRecorder()
+	ctx, _ = gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files?status=disabled&imported_from=2026-01-02&imported_to=2026-01-02", nil)
+
+	h.ListAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	payload = struct {
+		Files      []map[string]any `json:"files"`
+		Total      int              `json:"total"`
+		Limit      int              `json:"limit"`
+		Offset     int              `json:"offset"`
+		HasMore    bool             `json:"has_more"`
+		NextOffset int              `json:"next_offset"`
+	}{}
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode filtered response: %v", errDecode)
+	}
+	if payload.Total != 1 || len(payload.Files) != 1 || payload.Files[0]["name"] != "beta.json" {
+		t.Fatalf("filtered payload = %#v, want only beta.json", payload)
+	}
+}
+
 func TestListAuthFilesFromDiskFiltersByNameAndRejectsAuthIndex(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 
@@ -127,6 +218,90 @@ func TestListAuthFilesFromDiskFiltersByNameAndRejectsAuthIndex(t *testing.T) {
 	}
 	if len(payload.Files) != 0 {
 		t.Fatalf("files = %#v, want no disk fallback matches for auth_index", payload.Files)
+	}
+}
+
+func TestPatchAuthFilesStatusBatch(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	registerAuthForLookupTest(t, manager, &coreauth.Auth{
+		ID:       "auth-a",
+		FileName: "alpha.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	})
+	registerAuthForLookupTest(t, manager, &coreauth.Auth{
+		ID:       "auth-b",
+		FileName: "beta.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	})
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/status/batch", strings.NewReader(`{"names":["alpha.json","beta.json"],"disabled":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	h.PatchAuthFilesStatus(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	for _, id := range []string{"auth-a", "auth-b"} {
+		auth, ok := manager.GetByID(id)
+		if !ok {
+			t.Fatalf("expected %s to exist", id)
+		}
+		if !auth.Disabled || auth.Status != coreauth.StatusDisabled {
+			t.Fatalf("%s disabled/status = %v/%s, want disabled", id, auth.Disabled, auth.Status)
+		}
+	}
+}
+
+func TestPatchAuthFilesStatusBatchUsesAuthIndex(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	registerAuthForLookupTest(t, manager, &coreauth.Auth{
+		ID:       "auth-a",
+		Index:    "idx-a",
+		FileName: "shared-codex.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	})
+	registerAuthForLookupTest(t, manager, &coreauth.Auth{
+		ID:       "auth-b",
+		Index:    "idx-b",
+		FileName: "shared-codex.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	})
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/status/batch", strings.NewReader(`{"items":[{"name":"shared-codex.json","auth_index":"idx-b"}],"disabled":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	h.PatchAuthFilesStatus(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	authA, okA := manager.GetByID("auth-a")
+	authB, okB := manager.GetByID("auth-b")
+	if !okA || !okB {
+		t.Fatalf("expected both auth records to exist")
+	}
+	if authA.Disabled || authA.Status == coreauth.StatusDisabled {
+		t.Fatalf("auth-a was modified: %+v", authA)
+	}
+	if !authB.Disabled || authB.Status != coreauth.StatusDisabled {
+		t.Fatalf("auth-b was not disabled: %+v", authB)
 	}
 }
 

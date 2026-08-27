@@ -34,6 +34,19 @@ var (
 	newCodexOAuthService  = func(cfg *config.Config) codexOAuthService { return codex.NewCodexAuth(cfg) }
 )
 
+type authFileListOptions struct {
+	Name            string
+	AuthIndex       string
+	Status          string
+	ImportedFrom    time.Time
+	ImportedTo      time.Time
+	HasImportedFrom bool
+	HasImportedTo   bool
+	Limit           int
+	Offset          int
+	HasLimit        bool
+}
+
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
 	if len(meta) == 0 {
 		return time.Time{}, false
@@ -87,33 +100,256 @@ func parseLastRefreshValue(v any) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+func parseAuthFileListOptions(c *gin.Context) (authFileListOptions, error) {
+	opts := authFileListOptions{
+		Name:      strings.TrimSpace(c.Query("name")),
+		AuthIndex: strings.TrimSpace(c.Query("auth_index")),
+		Status:    normalizeAuthFileStatusFilter(c.Query("status")),
+	}
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		limit, err := strconv.Atoi(raw)
+		if err != nil || limit < 1 {
+			return opts, fmt.Errorf("limit must be a positive integer")
+		}
+		if limit > 1000 {
+			limit = 1000
+		}
+		opts.Limit = limit
+		opts.HasLimit = true
+	}
+	if raw := strings.TrimSpace(c.Query("offset")); raw != "" {
+		offset, err := strconv.Atoi(raw)
+		if err != nil || offset < 0 {
+			return opts, fmt.Errorf("offset must be a non-negative integer")
+		}
+		opts.Offset = offset
+	}
+	from, hasFrom, errFrom := parseAuthFileListTime(firstAuthFileQuery(c, "imported_from", "created_from", "from", "imported_after"), false)
+	if errFrom != nil {
+		return opts, fmt.Errorf("imported_from is invalid")
+	}
+	to, hasTo, errTo := parseAuthFileListTime(firstAuthFileQuery(c, "imported_to", "created_to", "to", "imported_before"), true)
+	if errTo != nil {
+		return opts, fmt.Errorf("imported_to is invalid")
+	}
+	opts.ImportedFrom = from
+	opts.HasImportedFrom = hasFrom
+	opts.ImportedTo = to
+	opts.HasImportedTo = hasTo
+	return opts, nil
+}
+
+func firstAuthFileQuery(c *gin.Context, names ...string) string {
+	if c == nil {
+		return ""
+	}
+	for _, name := range names {
+		if value := strings.TrimSpace(c.Query(name)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func parseAuthFileListTime(raw string, endOfDay bool) (time.Time, bool, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, false, nil
+	}
+	if unix, err := strconv.ParseInt(raw, 10, 64); err == nil && unix > 0 {
+		if unix < 1_000_000_000_000 {
+			return time.Unix(unix, 0), true, nil
+		}
+		return time.UnixMilli(unix), true, nil
+	}
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05",
+		"2006-01-02",
+	}
+	var parsed time.Time
+	var err error
+	for _, layout := range layouts {
+		if layout == "2006-01-02" {
+			parsed, err = time.ParseInLocation(layout, raw, time.Local)
+		} else {
+			parsed, err = time.Parse(layout, raw)
+			if err != nil {
+				parsed, err = time.ParseInLocation(layout, raw, time.Local)
+			}
+		}
+		if err == nil {
+			if layout == "2006-01-02" && endOfDay {
+				parsed = parsed.Add(24*time.Hour - time.Nanosecond)
+			}
+			return parsed, true, nil
+		}
+	}
+	return time.Time{}, false, fmt.Errorf("invalid time")
+}
+
+func normalizeAuthFileStatusFilter(status string) string {
+	status = strings.ToLower(strings.TrimSpace(status))
+	switch status {
+	case "", "all", "*":
+		return ""
+	case "enabled", "active":
+		return "enabled"
+	case "disabled", "inactive":
+		return "disabled"
+	case "problem", "error", "unavailable":
+		return "problem"
+	default:
+		return status
+	}
+}
+
+func matchesAuthFileStatus(disabled bool, status string, unavailable bool, statusMessage string, filter string) bool {
+	filter = normalizeAuthFileStatusFilter(filter)
+	if filter == "" {
+		return true
+	}
+	status = strings.ToLower(strings.TrimSpace(status))
+	statusMessage = strings.ToLower(strings.TrimSpace(statusMessage))
+	problem := !disabled && (unavailable || status == "error" || (statusMessage != "" && statusMessage != "ok" && statusMessage != "healthy" && statusMessage != "ready" && statusMessage != "success" && statusMessage != "available"))
+	switch filter {
+	case "enabled":
+		return !disabled
+	case "disabled":
+		return disabled || status == "disabled"
+	case "problem":
+		return problem
+	default:
+		return status == filter
+	}
+}
+
+func matchesAuthFileEntryOptions(entry gin.H, opts authFileListOptions) bool {
+	if entry == nil {
+		return false
+	}
+	disabled, _ := entry["disabled"].(bool)
+	status, _ := entry["status"].(string)
+	unavailable, _ := entry["unavailable"].(bool)
+	statusMessage, _ := entry["status_message"].(string)
+	if !matchesAuthFileStatus(disabled, status, unavailable, statusMessage, opts.Status) {
+		return false
+	}
+	importedAt := authFileEntryImportedAt(entry)
+	if opts.HasImportedFrom && (importedAt.IsZero() || importedAt.Before(opts.ImportedFrom)) {
+		return false
+	}
+	if opts.HasImportedTo && (importedAt.IsZero() || importedAt.After(opts.ImportedTo)) {
+		return false
+	}
+	return true
+}
+
+func authFileEntryImportedAt(entry gin.H) time.Time {
+	for _, key := range []string{"created_at", "modtime", "updated_at"} {
+		if value, ok := entry[key]; ok {
+			if ts, okParse := parseAuthFileEntryTime(value); okParse {
+				return ts
+			}
+		}
+	}
+	return time.Time{}
+}
+
+func parseAuthFileEntryTime(value any) (time.Time, bool) {
+	switch typed := value.(type) {
+	case time.Time:
+		return typed, !typed.IsZero()
+	case string:
+		parsed, ok, _ := parseAuthFileListTime(typed, false)
+		return parsed, ok
+	case int64:
+		if typed > 0 {
+			return time.Unix(typed, 0), true
+		}
+	case float64:
+		if typed > 0 {
+			return time.Unix(int64(typed), 0), true
+		}
+	}
+	return time.Time{}, false
+}
+
+func paginateAuths(auths []*coreauth.Auth, opts authFileListOptions) []*coreauth.Auth {
+	if opts.Offset >= len(auths) {
+		return nil
+	}
+	start := opts.Offset
+	end := len(auths)
+	if opts.HasLimit && start+opts.Limit < end {
+		end = start + opts.Limit
+	}
+	return auths[start:end]
+}
+
+func authFileListOffsetAllowed(index int, opts authFileListOptions) bool {
+	return index >= opts.Offset
+}
+
+func authFileListResponse(files []gin.H, total int, opts authFileListOptions) gin.H {
+	resp := gin.H{
+		"files":  files,
+		"total":  total,
+		"offset": opts.Offset,
+	}
+	if opts.HasLimit {
+		resp["limit"] = opts.Limit
+		nextOffset := opts.Offset + len(files)
+		hasMore := nextOffset < total
+		resp["has_more"] = hasMore
+		if hasMore {
+			resp["next_offset"] = nextOffset
+		}
+	} else {
+		resp["limit"] = 0
+		resp["has_more"] = false
+	}
+	return resp
+}
+
 func (h *Handler) ListAuthFiles(c *gin.Context) {
 	if h == nil {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
 		return
 	}
-	if h.authManager == nil {
-		h.listAuthFilesFromDisk(c)
+	opts, errOptions := parseAuthFileListOptions(c)
+	if errOptions != nil {
+		c.JSON(400, gin.H{"error": errOptions.Error()})
 		return
 	}
-	nameFilter := strings.TrimSpace(c.Query("name"))
-	authIndexFilter := strings.TrimSpace(c.Query("auth_index"))
+	if h.authManager == nil {
+		h.listAuthFilesFromDisk(c, opts)
+		return
+	}
 	auths := h.authManager.List()
-	files := make([]gin.H, 0, len(auths))
+	filtered := make([]*coreauth.Auth, 0, len(auths))
 	for _, auth := range auths {
-		if !matchesAuthFileLookup(auth, nameFilter, authIndexFilter) {
+		if !matchesAuthFileListOptions(auth, opts) {
 			continue
 		}
+		filtered = append(filtered, auth)
+	}
+	sort.Slice(filtered, func(i, j int) bool {
+		nameI := authListName(filtered[i])
+		nameJ := authListName(filtered[j])
+		return strings.ToLower(nameI) < strings.ToLower(nameJ)
+	})
+	total := len(filtered)
+	filtered = paginateAuths(filtered, opts)
+	files := make([]gin.H, 0, len(filtered))
+	for _, auth := range filtered {
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
 			files = append(files, entry)
 		}
 	}
-	sort.Slice(files, func(i, j int) bool {
-		nameI, _ := files[i]["name"].(string)
-		nameJ, _ := files[j]["name"].(string)
-		return strings.ToLower(nameI) < strings.ToLower(nameJ)
-	})
-	c.JSON(200, gin.H{"files": files})
+	c.JSON(200, authFileListResponse(files, total, opts))
 }
 
 func lockedAuthIndex(auth *coreauth.Auth) string {
@@ -136,6 +372,59 @@ func matchesAuthFileLookup(auth *coreauth.Auth, name string, authIndex string) b
 		return false
 	}
 	return true
+}
+
+func matchesAuthFileListOptions(auth *coreauth.Auth, opts authFileListOptions) bool {
+	if !matchesAuthFileLookup(auth, opts.Name, opts.AuthIndex) {
+		return false
+	}
+	disabled, status, unavailable, statusMessage := authDisabledStatus(auth)
+	if !matchesAuthFileStatus(disabled, status, unavailable, statusMessage, opts.Status) {
+		return false
+	}
+	importedAt := authImportedAt(auth)
+	if opts.HasImportedFrom && (importedAt.IsZero() || importedAt.Before(opts.ImportedFrom)) {
+		return false
+	}
+	if opts.HasImportedTo && (importedAt.IsZero() || importedAt.After(opts.ImportedTo)) {
+		return false
+	}
+	return true
+}
+
+func authListName(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if name := strings.TrimSpace(auth.FileName); name != "" {
+		return name
+	}
+	return strings.TrimSpace(auth.ID)
+}
+
+func authDisabledStatus(auth *coreauth.Auth) (disabled bool, status string, unavailable bool, statusMessage string) {
+	if auth == nil {
+		return false, "", false, ""
+	}
+	return auth.Disabled, strings.TrimSpace(string(auth.Status)), auth.Unavailable, strings.TrimSpace(auth.StatusMessage)
+}
+
+func authImportedAt(auth *coreauth.Auth) time.Time {
+	if auth == nil {
+		return time.Time{}
+	}
+	if !auth.CreatedAt.IsZero() {
+		return auth.CreatedAt
+	}
+	if !auth.UpdatedAt.IsZero() {
+		return auth.UpdatedAt
+	}
+	if path := strings.TrimSpace(authAttribute(auth, "path")); path != "" {
+		if info, err := os.Stat(path); err == nil {
+			return info.ModTime()
+		}
+	}
+	return time.Time{}
 }
 
 func (h *Handler) lookupAuthFile(name string, authIndex string) (*coreauth.Auth, bool) {
@@ -214,25 +503,27 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 }
 
 // List auth files from disk when the auth manager is unavailable.
-func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
-	nameFilter := strings.TrimSpace(c.Query("name"))
-	authIndexFilter := strings.TrimSpace(c.Query("auth_index"))
+func (h *Handler) listAuthFilesFromDisk(c *gin.Context, opts authFileListOptions) {
 	entries, err := os.ReadDir(h.cfg.AuthDir)
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
 		return
 	}
 	files := make([]gin.H, 0)
-	if authIndexFilter != "" {
-		c.JSON(200, gin.H{"files": files})
+	if opts.AuthIndex != "" {
+		c.JSON(200, authFileListResponse(files, 0, opts))
 		return
 	}
+	sort.Slice(entries, func(i, j int) bool {
+		return strings.ToLower(entries[i].Name()) < strings.ToLower(entries[j].Name())
+	})
+	total := 0
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
 		name := e.Name()
-		if nameFilter != "" && name != nameFilter {
+		if opts.Name != "" && name != opts.Name {
 			continue
 		}
 		if !strings.HasSuffix(strings.ToLower(name), ".json") {
@@ -297,10 +588,20 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				}
 			}
 
+			if !matchesAuthFileEntryOptions(fileData, opts) {
+				continue
+			}
+			total++
+			if !authFileListOffsetAllowed(total-1, opts) {
+				continue
+			}
+			if opts.HasLimit && len(files) >= opts.Limit {
+				continue
+			}
 			files = append(files, fileData)
 		}
 	}
-	c.JSON(200, gin.H{"files": files})
+	c.JSON(200, authFileListResponse(files, total, opts))
 }
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {

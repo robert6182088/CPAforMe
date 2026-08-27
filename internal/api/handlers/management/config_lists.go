@@ -143,17 +143,277 @@ func (h *Handler) deleteFromStringList(c *gin.Context, target *[]string, after f
 }
 
 // api-keys
-func (h *Handler) GetAPIKeys(c *gin.Context) { c.JSON(200, gin.H{"api-keys": h.cfg.APIKeys}) }
+func (h *Handler) GetAPIKeys(c *gin.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	entries := h.cfg.AccessAPIKeyEntries()
+	c.JSON(200, gin.H{
+		"api-keys":        apiKeysFromEntriesOrLegacy(entries, h.cfg.APIKeys),
+		"api-key-entries": entries,
+	})
+}
+
 func (h *Handler) PutAPIKeys(c *gin.Context) {
-	h.putStringList(c, func(v []string) {
-		h.cfg.APIKeys = append([]string(nil), v...)
-	}, nil)
+	data, errRead := c.GetRawData()
+	if errRead != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	if entries, ok := decodeAPIKeyEntriesPayload(data); ok {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.cfg.APIKeyEntries = config.NormalizeAPIKeyEntries(entries)
+		syncLegacyAPIKeysFromEntries(h.cfg)
+		h.persistLocked(c)
+		return
+	}
+	if keys, ok := decodeAPIKeysPayload(data); ok {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.cfg.APIKeys = config.NormalizeAPIKeys(keys)
+		h.cfg.APIKeyEntries = nil
+		h.persistLocked(c)
+		return
+	}
+	c.JSON(400, gin.H{"error": "invalid body"})
 }
+
 func (h *Handler) PatchAPIKeys(c *gin.Context) {
-	h.patchStringList(c, &h.cfg.APIKeys, func() {})
+	var body struct {
+		Old   *string         `json:"old"`
+		New   *string         `json:"new"`
+		Index *int            `json:"index"`
+		Value json.RawMessage `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	useEntries := len(h.cfg.APIKeyEntries) > 0 || apiKeyPatchValueIsObject(body.Value)
+	if useEntries {
+		entries := h.cfg.AccessAPIKeyEntries()
+		if body.Index != nil && len(body.Value) > 0 {
+			if *body.Index < 0 || *body.Index >= len(entries) {
+				c.JSON(404, gin.H{"error": "item not found"})
+				return
+			}
+			updated, errPatch := applyAPIKeyEntryPatch(entries[*body.Index], body.Value)
+			if errPatch != nil {
+				c.JSON(400, gin.H{"error": errPatch.Error()})
+				return
+			}
+			entries[*body.Index] = updated
+			h.cfg.APIKeyEntries = config.NormalizeAPIKeyEntries(entries)
+			syncLegacyAPIKeysFromEntries(h.cfg)
+			h.persistLocked(c)
+			return
+		}
+		if body.New != nil {
+			newKey := strings.TrimSpace(*body.New)
+			if body.Old != nil {
+				oldKey := strings.TrimSpace(*body.Old)
+				for i := range entries {
+					if entries[i].APIKey == oldKey {
+						entries[i].APIKey = newKey
+						h.cfg.APIKeyEntries = config.NormalizeAPIKeyEntries(entries)
+						syncLegacyAPIKeysFromEntries(h.cfg)
+						h.persistLocked(c)
+						return
+					}
+				}
+			}
+			entries = append(entries, config.APIKeyEntry{APIKey: newKey})
+			h.cfg.APIKeyEntries = config.NormalizeAPIKeyEntries(entries)
+			syncLegacyAPIKeysFromEntries(h.cfg)
+			h.persistLocked(c)
+			return
+		}
+		c.JSON(400, gin.H{"error": "missing fields"})
+		return
+	}
+
+	if body.Index != nil && len(body.Value) > 0 && *body.Index >= 0 && *body.Index < len(h.cfg.APIKeys) {
+		var value string
+		if errUnmarshal := json.Unmarshal(body.Value, &value); errUnmarshal != nil {
+			c.JSON(400, gin.H{"error": "value must be a string"})
+			return
+		}
+		h.cfg.APIKeys[*body.Index] = value
+		h.cfg.APIKeys = config.NormalizeAPIKeys(h.cfg.APIKeys)
+		h.persistLocked(c)
+		return
+	}
+	if body.New != nil {
+		newKey := strings.TrimSpace(*body.New)
+		if body.Old != nil {
+			oldKey := *body.Old
+			for i := range h.cfg.APIKeys {
+				if h.cfg.APIKeys[i] == oldKey {
+					h.cfg.APIKeys[i] = newKey
+					h.cfg.APIKeys = config.NormalizeAPIKeys(h.cfg.APIKeys)
+					h.persistLocked(c)
+					return
+				}
+			}
+		}
+		h.cfg.APIKeys = config.NormalizeAPIKeys(append(h.cfg.APIKeys, newKey))
+		h.persistLocked(c)
+		return
+	}
+	c.JSON(400, gin.H{"error": "missing fields"})
 }
+
 func (h *Handler) DeleteAPIKeys(c *gin.Context) {
-	h.deleteFromStringList(c, &h.cfg.APIKeys, func() {})
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.cfg.APIKeyEntries) > 0 {
+		entries := h.cfg.AccessAPIKeyEntries()
+		if idxStr := c.Query("index"); idxStr != "" {
+			var idx int
+			if _, errScan := fmt.Sscanf(idxStr, "%d", &idx); errScan == nil && idx >= 0 && idx < len(entries) {
+				entries = append(entries[:idx], entries[idx+1:]...)
+				h.cfg.APIKeyEntries = config.NormalizeAPIKeyEntries(entries)
+				syncLegacyAPIKeysFromEntries(h.cfg)
+				h.persistLocked(c)
+				return
+			}
+		}
+		if val := strings.TrimSpace(c.Query("value")); val != "" {
+			out := make([]config.APIKeyEntry, 0, len(entries))
+			for _, entry := range entries {
+				if strings.TrimSpace(entry.APIKey) != val {
+					out = append(out, entry)
+				}
+			}
+			h.cfg.APIKeyEntries = config.NormalizeAPIKeyEntries(out)
+			syncLegacyAPIKeysFromEntries(h.cfg)
+			h.persistLocked(c)
+			return
+		}
+		c.JSON(400, gin.H{"error": "missing index or value"})
+		return
+	}
+	if idxStr := c.Query("index"); idxStr != "" {
+		var idx int
+		if _, errScan := fmt.Sscanf(idxStr, "%d", &idx); errScan == nil && idx >= 0 && idx < len(h.cfg.APIKeys) {
+			h.cfg.APIKeys = append(h.cfg.APIKeys[:idx], h.cfg.APIKeys[idx+1:]...)
+			h.cfg.APIKeys = config.NormalizeAPIKeys(h.cfg.APIKeys)
+			h.persistLocked(c)
+			return
+		}
+	}
+	if val := strings.TrimSpace(c.Query("value")); val != "" {
+		out := make([]string, 0, len(h.cfg.APIKeys))
+		for _, key := range h.cfg.APIKeys {
+			if strings.TrimSpace(key) != val {
+				out = append(out, key)
+			}
+		}
+		h.cfg.APIKeys = config.NormalizeAPIKeys(out)
+		h.persistLocked(c)
+		return
+	}
+	c.JSON(400, gin.H{"error": "missing index or value"})
+}
+
+func decodeAPIKeyEntriesPayload(data []byte) ([]config.APIKeyEntry, bool) {
+	var entries []config.APIKeyEntry
+	if errUnmarshal := json.Unmarshal(data, &entries); errUnmarshal == nil {
+		return entries, true
+	}
+	var obj struct {
+		Items         []config.APIKeyEntry `json:"items"`
+		APIKeyEntries []config.APIKeyEntry `json:"api-key-entries"`
+	}
+	if errUnmarshal := json.Unmarshal(data, &obj); errUnmarshal != nil {
+		return nil, false
+	}
+	if obj.APIKeyEntries != nil {
+		return obj.APIKeyEntries, true
+	}
+	if obj.Items != nil {
+		return obj.Items, true
+	}
+	return nil, false
+}
+
+func decodeAPIKeysPayload(data []byte) ([]string, bool) {
+	var keys []string
+	if errUnmarshal := json.Unmarshal(data, &keys); errUnmarshal == nil {
+		return keys, true
+	}
+	var obj struct {
+		Items   []string `json:"items"`
+		APIKeys []string `json:"api-keys"`
+	}
+	if errUnmarshal := json.Unmarshal(data, &obj); errUnmarshal != nil {
+		return nil, false
+	}
+	if obj.APIKeys != nil {
+		return obj.APIKeys, true
+	}
+	if obj.Items != nil {
+		return obj.Items, true
+	}
+	return nil, false
+}
+
+func apiKeyPatchValueIsObject(raw json.RawMessage) bool {
+	return len(raw) > 0 && strings.HasPrefix(strings.TrimSpace(string(raw)), "{")
+}
+
+func applyAPIKeyEntryPatch(entry config.APIKeyEntry, raw json.RawMessage) (config.APIKeyEntry, error) {
+	if !apiKeyPatchValueIsObject(raw) {
+		var key string
+		if errUnmarshal := json.Unmarshal(raw, &key); errUnmarshal != nil {
+			return entry, fmt.Errorf("value must be a string or object")
+		}
+		entry.APIKey = strings.TrimSpace(key)
+		return entry, nil
+	}
+	var patch struct {
+		APIKey   *string `json:"api-key"`
+		Key      *string `json:"key"`
+		Alias    *string `json:"alias"`
+		Disabled *bool   `json:"disabled"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &patch); errUnmarshal != nil {
+		return entry, fmt.Errorf("invalid api key entry patch")
+	}
+	if patch.APIKey != nil {
+		entry.APIKey = strings.TrimSpace(*patch.APIKey)
+	} else if patch.Key != nil {
+		entry.APIKey = strings.TrimSpace(*patch.Key)
+	}
+	if patch.Alias != nil {
+		entry.Alias = strings.TrimSpace(*patch.Alias)
+	}
+	if patch.Disabled != nil {
+		entry.Disabled = *patch.Disabled
+	}
+	return entry, nil
+}
+
+func apiKeysFromEntriesOrLegacy(entries []config.APIKeyEntry, legacy []string) []string {
+	if len(entries) == 0 {
+		return config.NormalizeAPIKeys(legacy)
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, entry.APIKey)
+	}
+	return config.NormalizeAPIKeys(out)
+}
+
+func syncLegacyAPIKeysFromEntries(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	cfg.APIKeys = cfg.EffectiveAPIKeys()
 }
 
 // gemini-api-key: []GeminiKey
