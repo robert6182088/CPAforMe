@@ -196,7 +196,7 @@ func TestGetAPIKeyAuthOccupancy_ReturnsEnabledAPIKeyClaims(t *testing.T) {
 		SDKConfig: config.SDKConfig{
 			APIKeyEntries: []config.APIKeyEntry{
 				{APIKey: "sk-zhangsan", Alias: "张三"},
-				{APIKey: "sk-lisi", Alias: "李四", Disabled: true},
+				{APIKey: "sk-lisi", Alias: "李四"},
 			},
 		},
 		AuthDir: t.TempDir(),
@@ -225,17 +225,40 @@ func TestGetAPIKeyAuthOccupancy_ReturnsEnabledAPIKeyClaims(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode payload: %v", err)
 	}
-	if len(payload.Items) != 1 {
-		t.Fatalf("items len = %d, want 1: %#v", len(payload.Items), payload.Items)
+	if len(payload.Items) != 2 {
+		t.Fatalf("items len = %d, want 2: %#v", len(payload.Items), payload.Items)
 	}
-	if got := payload.Items[0].Alias; got != "张三" {
-		t.Fatalf("alias = %q, want 张三", got)
+
+	var zhangsan, lisi *apiKeyAuthOccupancyEntry
+	for i := range payload.Items {
+		item := &payload.Items[i]
+		switch item.Alias {
+		case "张三":
+			zhangsan = item
+		case "李四":
+			lisi = item
+		}
 	}
-	if len(payload.Items[0].Credentials) != 1 {
-		t.Fatalf("credentials len = %d, want 1: %#v", len(payload.Items[0].Credentials), payload.Items[0].Credentials)
+	if zhangsan == nil || lisi == nil {
+		t.Fatalf("missing expected entries: %#v", payload.Items)
 	}
-	credential := payload.Items[0].Credentials[0]
+	if zhangsan.UsageStatus != "active" {
+		t.Fatalf("张三 usage status = %q, want active", zhangsan.UsageStatus)
+	}
+	if zhangsan.LastRequestAt.IsZero() {
+		t.Fatal("张三 last_request_at is zero, want recent timestamp")
+	}
+	if len(zhangsan.Credentials) != 1 {
+		t.Fatalf("张三 credentials len = %d, want 1: %#v", len(zhangsan.Credentials), zhangsan.Credentials)
+	}
+	credential := zhangsan.Credentials[0]
 	if credential.Name != "codex-user.json" || credential.Account != "codex-user@example.com" || credential.Status != coreauth.StatusActive {
 		t.Fatalf("credential = %#v, want codex-user.json/codex-user@example.com/active", credential)
+	}
+	if lisi.UsageStatus != "idle" {
+		t.Fatalf("李四 usage status = %q, want idle", lisi.UsageStatus)
+	}
+	if !lisi.LastRequestAt.IsZero() {
+		t.Fatalf("李四 last_request_at = %v, want zero", lisi.LastRequestAt)
 	}
 }

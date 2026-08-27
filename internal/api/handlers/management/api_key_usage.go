@@ -19,9 +19,11 @@ type apiKeyUsageEntry struct {
 }
 
 type apiKeyAuthOccupancyEntry struct {
-	APIKey      string                         `json:"api-key"`
-	Alias       string                         `json:"alias,omitempty"`
-	Credentials []coreauth.CallerAuthOccupancy `json:"credentials"`
+	APIKey        string                         `json:"api-key"`
+	Alias         string                         `json:"alias,omitempty"`
+	UsageStatus   string                         `json:"usage_status,omitempty"`
+	LastRequestAt time.Time                      `json:"last_request_at,omitempty"`
+	Credentials   []coreauth.CallerAuthOccupancy `json:"credentials"`
 }
 
 func mergeRecentRequestBuckets(dst, src []coreauth.RecentRequestBucket) []coreauth.RecentRequestBucket {
@@ -174,11 +176,21 @@ func (h *Handler) GetAPIKeyAuthOccupancy(c *gin.Context) {
 	}
 
 	occupancy := manager.CallerAuthOccupancySnapshot(scopes)
+	activity := manager.CallerActivitySnapshot(scopes)
 	out := make([]apiKeyAuthOccupancyEntry, 0, len(items))
 	for _, entry := range items {
 		entry.item.Credentials = occupancy[entry.scope]
 		if entry.item.Credentials == nil {
 			entry.item.Credentials = []coreauth.CallerAuthOccupancy{}
+		}
+		if lastRequestAt, ok := activity[entry.scope]; ok && !lastRequestAt.IsZero() {
+			entry.item.LastRequestAt = lastRequestAt
+			if time.Since(lastRequestAt) <= 10*time.Minute {
+				entry.item.UsageStatus = "active"
+			}
+		}
+		if entry.item.UsageStatus == "" {
+			entry.item.UsageStatus = "idle"
 		}
 		out = append(out, entry.item)
 	}

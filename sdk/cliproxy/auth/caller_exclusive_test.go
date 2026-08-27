@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -129,5 +130,76 @@ func TestManagerCallerExclusiveAuthReleasesDisabledAPIKeyClaimsOnConfigUpdate(t 
 	}
 	if got == nil || got.ID != "auth-a" {
 		t.Fatalf("pickNext(lisi) auth = %#v, want released auth-a", got)
+	}
+}
+
+func TestManagerCallerExclusiveAuthSnapshotOrdersLatestClaimFirst(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.auths = map[string]*Auth{
+		"auth-old": callerExclusiveTestAuth("auth-old", "old@example.com"),
+		"auth-new": callerExclusiveTestAuth("auth-new", "new@example.com"),
+	}
+	zhangsanScope := cliproxysession.CallerScope("sk-zhangsan")
+	manager.callerExclusiveAuthOwners = map[string]callerExclusiveOwnerRecord{
+		callerExclusiveAuthResourceKey(manager.auths["auth-old"]): {Owner: zhangsanScope, Sequence: 1, ClaimedAt: time.Now().Add(-time.Hour)},
+		callerExclusiveAuthResourceKey(manager.auths["auth-new"]): {Owner: zhangsanScope, Sequence: 2, ClaimedAt: time.Now()},
+	}
+
+	snapshot := manager.CallerAuthOccupancySnapshot([]string{zhangsanScope})
+	items := snapshot[zhangsanScope]
+	if len(items) != 2 {
+		t.Fatalf("items len = %d, want 2: %#v", len(items), items)
+	}
+	if got := items[0].Name; got != "auth-new.json" {
+		t.Fatalf("latest item name = %q, want auth-new.json", got)
+	}
+	if got := items[0].ClaimSequence; got != 2 {
+		t.Fatalf("latest item sequence = %d, want 2", got)
+	}
+	if got := items[1].Name; got != "auth-old.json" {
+		t.Fatalf("older item name = %q, want auth-old.json", got)
+	}
+}
+
+func TestManagerCallerExclusiveAuthPrunesExpiredClaims(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := callerExclusiveTestAuth("auth-old", "old@example.com")
+	manager.auths = map[string]*Auth{
+		auth.ID: auth,
+	}
+	zhangsanScope := cliproxysession.CallerScope("sk-zhangsan")
+	manager.callerExclusiveAuthOwners = map[string]callerExclusiveOwnerRecord{
+		callerExclusiveAuthResourceKey(auth): {Owner: zhangsanScope, Sequence: 1, ClaimedAt: time.Now().Add(-(callerExclusiveAuthTTL + time.Hour))},
+	}
+
+	snapshot := manager.CallerAuthOccupancySnapshot([]string{zhangsanScope})
+	if items := snapshot[zhangsanScope]; len(items) != 0 {
+		t.Fatalf("items len = %d, want 0 after expiry: %#v", len(items), items)
+	}
+	if len(manager.callerExclusiveAuthOwners) != 0 {
+		t.Fatalf("owners len = %d, want 0 after expiry cleanup", len(manager.callerExclusiveAuthOwners))
+	}
+}
+
+func TestManagerCallerExclusiveAuthRefreshesClaimTimeForSameOwner(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := callerExclusiveTestAuth("auth-a", "a@example.com")
+	resourceKey := callerExclusiveAuthResourceKey(auth)
+	oldClaimedAt := time.Now().Add(-(callerExclusiveAuthTTL - time.Hour))
+	zhangsanScope := cliproxysession.CallerScope("sk-zhangsan")
+	manager.callerExclusiveAuthOwners = map[string]callerExclusiveOwnerRecord{
+		resourceKey: {Owner: zhangsanScope, Sequence: 1, ClaimedAt: oldClaimedAt},
+	}
+	manager.callerExclusiveAuthSeq.Store(1)
+
+	if !manager.claimAuthForCaller(auth, callerExclusiveTestOptions("sk-zhangsan")) {
+		t.Fatal("claimAuthForCaller() = false, want true for same owner")
+	}
+	state := manager.callerExclusiveAuthOwners[resourceKey]
+	if !state.ClaimedAt.After(oldClaimedAt) {
+		t.Fatalf("claimedAt = %s, want after %s", state.ClaimedAt, oldClaimedAt)
+	}
+	if state.Sequence <= 1 {
+		t.Fatalf("sequence = %d, want refreshed sequence > 1", state.Sequence)
 	}
 }

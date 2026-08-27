@@ -138,10 +138,12 @@ func (l *authAutoRefreshLoop) loop(ctx context.Context) {
 			return
 		case <-l.wakeCh:
 			now := time.Now()
+			l.manager.pruneExpiredCallerExclusiveOwners(now)
 			l.applyDirty(now)
 			l.resetTimer(timer, &timerCh, now)
 		case <-timerCh:
 			now := time.Now()
+			l.manager.pruneExpiredCallerExclusiveOwners(now)
 			l.handleDue(ctx, now)
 			l.applyDirty(now)
 			l.resetTimer(timer, &timerCh, now)

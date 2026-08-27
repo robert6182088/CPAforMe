@@ -10,6 +10,14 @@ import (
 	cliproxysession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
 )
 
+type callerExclusiveOwnerRecord struct {
+	Owner     string
+	Sequence  uint64
+	ClaimedAt time.Time
+}
+
+const callerExclusiveAuthTTL = 72 * time.Hour
+
 // CallerAuthOccupancy describes one auth file account currently owned by a downstream API key.
 type CallerAuthOccupancy struct {
 	AuthID        string    `json:"auth_id"`
@@ -23,6 +31,8 @@ type CallerAuthOccupancy struct {
 	StatusMessage string    `json:"status_message,omitempty"`
 	Disabled      bool      `json:"disabled"`
 	Unavailable   bool      `json:"unavailable"`
+	ClaimSequence uint64    `json:"claim_sequence,omitempty"`
+	ClaimedAt     time.Time `json:"claimed_at,omitempty"`
 	UpdatedAt     time.Time `json:"updated_at,omitempty"`
 }
 
@@ -52,6 +62,36 @@ func callerExclusiveAuthResourceKey(auth *Auth) string {
 	return "auth-id|" + authID
 }
 
+func (m *Manager) nextCallerExclusiveClaimSequence() uint64 {
+	if m == nil {
+		return 0
+	}
+	return m.callerExclusiveAuthSeq.Add(1)
+}
+
+func (m *Manager) pruneExpiredCallerExclusiveOwners(now time.Time) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pruneExpiredCallerExclusiveOwnersLocked(now)
+}
+
+func (m *Manager) pruneExpiredCallerExclusiveOwnersLocked(now time.Time) {
+	if m == nil || len(m.callerExclusiveAuthOwners) == 0 {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	for resourceKey, state := range m.callerExclusiveAuthOwners {
+		if strings.TrimSpace(state.Owner) == "" || (!state.ClaimedAt.IsZero() && now.Sub(state.ClaimedAt) > callerExclusiveAuthTTL) {
+			delete(m.callerExclusiveAuthOwners, resourceKey)
+		}
+	}
+}
+
 func callerExclusiveAuthEligible(auth *Auth) bool {
 	if auth == nil || auth.AuthKind() != AuthKindOAuth {
 		return false
@@ -72,6 +112,7 @@ func (m *Manager) withCallerExclusiveTried(opts cliproxyexecutor.Options, tried 
 	if callerScope == "" {
 		return tried
 	}
+	m.pruneExpiredCallerExclusiveOwners(time.Now())
 	m.mu.RLock()
 	if len(m.callerExclusiveAuthOwners) == 0 {
 		m.mu.RUnlock()
@@ -86,7 +127,7 @@ func (m *Manager) withCallerExclusiveTried(opts cliproxyexecutor.Options, tried 
 		if resourceKey == "" {
 			continue
 		}
-		owner := strings.TrimSpace(m.callerExclusiveAuthOwners[resourceKey])
+		owner := strings.TrimSpace(m.callerExclusiveAuthOwners[resourceKey].Owner)
 		if owner == "" || owner == callerScope {
 			continue
 		}
@@ -118,7 +159,7 @@ func (m *Manager) authAllowedForCallerLocked(auth *Auth, callerScope string) boo
 	if resourceKey == "" {
 		return true
 	}
-	owner := strings.TrimSpace(m.callerExclusiveAuthOwners[resourceKey])
+	owner := strings.TrimSpace(m.callerExclusiveAuthOwners[resourceKey].Owner)
 	return owner == "" || owner == callerScope
 }
 
@@ -136,14 +177,25 @@ func (m *Manager) claimAuthForCaller(auth *Auth, opts cliproxyexecutor.Options) 
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := time.Now()
+	m.pruneExpiredCallerExclusiveOwnersLocked(now)
 	if m.callerExclusiveAuthOwners == nil {
-		m.callerExclusiveAuthOwners = make(map[string]string)
+		m.callerExclusiveAuthOwners = make(map[string]callerExclusiveOwnerRecord)
 	}
-	if existing := strings.TrimSpace(m.callerExclusiveAuthOwners[resourceKey]); existing == "" {
-		m.callerExclusiveAuthOwners[resourceKey] = callerScope
+	if existing := strings.TrimSpace(m.callerExclusiveAuthOwners[resourceKey].Owner); existing == "" {
+		m.callerExclusiveAuthOwners[resourceKey] = callerExclusiveOwnerRecord{
+			Owner:     callerScope,
+			Sequence:  m.nextCallerExclusiveClaimSequence(),
+			ClaimedAt: now,
+		}
 		return true
 	} else if existing != callerScope {
 		return false
+	}
+	m.callerExclusiveAuthOwners[resourceKey] = callerExclusiveOwnerRecord{
+		Owner:     callerScope,
+		Sequence:  m.nextCallerExclusiveClaimSequence(),
+		ClaimedAt: now,
 	}
 	return true
 }
@@ -157,9 +209,10 @@ func (m *Manager) moveCallerExclusiveOwnerLocked(oldAuth, newAuth *Auth) {
 	if oldKey == "" || oldKey == newKey {
 		return
 	}
-	owner := strings.TrimSpace(m.callerExclusiveAuthOwners[oldKey])
-	if owner != "" && newKey != "" && strings.TrimSpace(m.callerExclusiveAuthOwners[newKey]) == "" {
-		m.callerExclusiveAuthOwners[newKey] = owner
+	state := m.callerExclusiveAuthOwners[oldKey]
+	owner := strings.TrimSpace(state.Owner)
+	if owner != "" && newKey != "" && strings.TrimSpace(m.callerExclusiveAuthOwners[newKey].Owner) == "" {
+		m.callerExclusiveAuthOwners[newKey] = state
 	}
 	m.deleteCallerExclusiveOwnerIfUnusedLocked(oldKey)
 }
@@ -180,6 +233,7 @@ func (m *Manager) pruneCallerExclusiveOwnersLocked() {
 	if m == nil || len(m.callerExclusiveAuthOwners) == 0 {
 		return
 	}
+	m.pruneExpiredCallerExclusiveOwnersLocked(time.Now())
 	activeKeys := make(map[string]struct{}, len(m.auths))
 	for _, auth := range m.auths {
 		if resourceKey := callerExclusiveAuthResourceKey(auth); resourceKey != "" {
@@ -214,12 +268,13 @@ func (m *Manager) pruneCallerExclusiveOwnersForConfig(cfg *internalconfig.Config
 	if len(m.callerExclusiveAuthOwners) == 0 {
 		return
 	}
+	m.pruneExpiredCallerExclusiveOwnersLocked(time.Now())
 	if len(enabledScopes) == 0 {
 		clear(m.callerExclusiveAuthOwners)
 		return
 	}
-	for resourceKey, owner := range m.callerExclusiveAuthOwners {
-		if _, ok := enabledScopes[strings.TrimSpace(owner)]; !ok {
+	for resourceKey, state := range m.callerExclusiveAuthOwners {
+		if _, ok := enabledScopes[strings.TrimSpace(state.Owner)]; !ok {
 			delete(m.callerExclusiveAuthOwners, resourceKey)
 		}
 	}
@@ -244,8 +299,9 @@ func (m *Manager) CallerAuthOccupancySnapshot(callerScopes []string) map[string]
 		return result
 	}
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	m.pruneExpiredCallerExclusiveOwnersLocked(time.Now())
+	defer m.mu.Unlock()
 	for _, auth := range m.auths {
 		if auth == nil {
 			continue
@@ -254,14 +310,18 @@ func (m *Manager) CallerAuthOccupancySnapshot(callerScopes []string) map[string]
 		if resourceKey == "" {
 			continue
 		}
-		owner := strings.TrimSpace(m.callerExclusiveAuthOwners[resourceKey])
+		state := m.callerExclusiveAuthOwners[resourceKey]
+		owner := strings.TrimSpace(state.Owner)
 		if _, ok := allowed[owner]; !ok {
 			continue
 		}
-		result[owner] = append(result[owner], callerAuthOccupancyFromAuth(auth))
+		result[owner] = append(result[owner], callerAuthOccupancyFromAuth(auth, state.Sequence, state.ClaimedAt))
 	}
 	for scope := range result {
 		sort.Slice(result[scope], func(i, j int) bool {
+			if result[scope][i].ClaimSequence != result[scope][j].ClaimSequence {
+				return result[scope][i].ClaimSequence > result[scope][j].ClaimSequence
+			}
 			left := strings.ToLower(result[scope][i].Provider + "|" + result[scope][i].Name + "|" + result[scope][i].AuthID)
 			right := strings.ToLower(result[scope][j].Provider + "|" + result[scope][j].Name + "|" + result[scope][j].AuthID)
 			return left < right
@@ -270,7 +330,7 @@ func (m *Manager) CallerAuthOccupancySnapshot(callerScopes []string) map[string]
 	return result
 }
 
-func callerAuthOccupancyFromAuth(auth *Auth) CallerAuthOccupancy {
+func callerAuthOccupancyFromAuth(auth *Auth, sequence uint64, claimedAt time.Time) CallerAuthOccupancy {
 	name := strings.TrimSpace(auth.FileName)
 	if name == "" {
 		name = strings.TrimSpace(auth.Label)
@@ -300,6 +360,8 @@ func callerAuthOccupancyFromAuth(auth *Auth) CallerAuthOccupancy {
 		StatusMessage: strings.TrimSpace(auth.StatusMessage),
 		Disabled:      auth.Disabled,
 		Unavailable:   auth.Unavailable,
+		ClaimSequence: sequence,
+		ClaimedAt:     claimedAt,
 		UpdatedAt:     auth.UpdatedAt,
 	}
 }

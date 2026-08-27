@@ -132,7 +132,10 @@ type Manager struct {
 	homeSessionLocks      sync.Map
 	homeSessionAliases    homeSessionAliasCache
 	// callerExclusiveAuthOwners binds file-backed OAuth accounts to downstream API keys.
-	callerExclusiveAuthOwners map[string]string
+	callerExclusiveAuthOwners map[string]callerExclusiveOwnerRecord
+	callerExclusiveAuthSeq    atomic.Uint64
+	// callerActivity tracks the most recent request time for each downstream API key scope.
+	callerActivity map[string]time.Time
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets             map[string]int
 	homeDispatchBundle          atomic.Pointer[HomeDispatchBundle]
@@ -186,7 +189,8 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		homeRuntimeAuths:          make(map[string]map[string]*Auth),
 		homeRuntimeAuthOwners:     make(map[string]map[string]*HomeDispatchSelection),
 		homeSessionSelections:     make(map[string]map[homeSessionSelectionKey]*HomeDispatchSelection),
-		callerExclusiveAuthOwners: make(map[string]string),
+		callerExclusiveAuthOwners: make(map[string]callerExclusiveOwnerRecord),
+		callerActivity:            make(map[string]time.Time),
 		providerOffsets:           make(map[string]int),
 		modelPoolOffsets:          make(map[string]int),
 	}
