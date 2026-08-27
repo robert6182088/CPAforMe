@@ -149,10 +149,73 @@ func StaticDir(configFilePath string) string {
 		return cleaned
 	}
 
+	for _, dir := range bundledStaticDirCandidates(configFilePath) {
+		if managementAssetExists(dir) {
+			return dir
+		}
+	}
+
 	if writable := util.WritablePath(); writable != "" {
 		return filepath.Join(writable, "static")
 	}
 
+	if dir := configStaticDir(configFilePath); dir != "" {
+		return dir
+	}
+
+	if workingDir, err := os.Getwd(); err == nil && strings.TrimSpace(workingDir) != "" {
+		return filepath.Join(workingDir, "static")
+	}
+
+	if executablePath, err := os.Executable(); err == nil && strings.TrimSpace(executablePath) != "" {
+		return filepath.Join(filepath.Dir(executablePath), "static")
+	}
+
+	return ""
+}
+
+func bundledStaticDirCandidates(configFilePath string) []string {
+	candidates := make([]string, 0, 3)
+	if dir := configStaticDir(configFilePath); dir != "" {
+		candidates = append(candidates, dir)
+	}
+	if workingDir, err := os.Getwd(); err == nil && strings.TrimSpace(workingDir) != "" {
+		candidates = append(candidates, filepath.Join(workingDir, "static"))
+	}
+	if executablePath, err := os.Executable(); err == nil && strings.TrimSpace(executablePath) != "" {
+		candidates = append(candidates, filepath.Join(filepath.Dir(executablePath), "static"))
+	}
+	return uniqueCleanDirs(candidates)
+}
+
+func uniqueCleanDirs(dirs []string) []string {
+	seen := make(map[string]struct{}, len(dirs))
+	unique := make([]string, 0, len(dirs))
+	for _, dir := range dirs {
+		dir = filepath.Clean(strings.TrimSpace(dir))
+		if dir == "." || dir == "" {
+			continue
+		}
+		key := strings.ToLower(dir)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, dir)
+	}
+	return unique
+}
+
+func managementAssetExists(staticDir string) bool {
+	staticDir = strings.TrimSpace(staticDir)
+	if staticDir == "" {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(staticDir, managementAssetName))
+	return err == nil && !info.IsDir()
+}
+
+func configStaticDir(configFilePath string) string {
 	configFilePath = strings.TrimSpace(configFilePath)
 	if configFilePath == "" {
 		return ""

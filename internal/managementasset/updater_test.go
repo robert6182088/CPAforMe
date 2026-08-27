@@ -3,6 +3,8 @@ package managementasset
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -63,6 +65,26 @@ func TestFetchLatestAssetOmitsAuthorizationWithoutToken(t *testing.T) {
 	}
 	if remoteHash != "abc123" {
 		t.Fatalf("remoteHash = %q, want %q", remoteHash, "abc123")
+	}
+}
+
+func TestStaticDirPrefersConfigAdjacentAsset(t *testing.T) {
+	t.Setenv("MANAGEMENT_STATIC_PATH", "")
+	t.Setenv("WRITABLE_PATH", filepath.Join(t.TempDir(), "writable"))
+	t.Setenv("writable_path", "")
+
+	configDir := t.TempDir()
+	staticDir := filepath.Join(configDir, "static")
+	if err := os.MkdirAll(staticDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(staticDir, managementAssetName), []byte("management"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	got := StaticDir(filepath.Join(configDir, "config.yaml"))
+	if got != staticDir {
+		t.Fatalf("StaticDir() = %q, want %q", got, staticDir)
 	}
 }
 
