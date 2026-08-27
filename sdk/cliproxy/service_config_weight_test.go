@@ -21,6 +21,34 @@ func TestWeightedRoundRobinRoutingSelector(t *testing.T) {
 	}
 }
 
+func TestServerListenStateTracksTLSChanges(t *testing.T) {
+	base := normalizedServerListenState(&internalconfig.Config{
+		Host: " 127.0.0.1 ",
+		Port: 8317,
+		TLS: internalconfig.TLSConfig{
+			Enable: false,
+			Cert:   " cert.pem ",
+			Key:    " key.pem ",
+		},
+	})
+	enabled := normalizedServerListenState(&internalconfig.Config{
+		Host: "127.0.0.1",
+		Port: 8317,
+		TLS: internalconfig.TLSConfig{
+			Enable: true,
+			Cert:   "cert.pem",
+			Key:    "key.pem",
+		},
+	})
+
+	if base == enabled {
+		t.Fatal("expected TLS enable change to require an API server listener reload")
+	}
+	if base.host != "127.0.0.1" || base.tlsCert != "cert.pem" || base.tlsKey != "key.pem" {
+		t.Fatalf("listen state was not normalized: %#v", base)
+	}
+}
+
 func TestServiceRejectsInvalidCredentialWeightConfigCommit(t *testing.T) {
 	originalCfg := &internalconfig.Config{}
 	service := &Service{cfg: originalCfg}

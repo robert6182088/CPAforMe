@@ -272,15 +272,7 @@ func (s *Server) Start() error {
 
 	useTLS := s.cfg != nil && s.cfg.TLS.Enable
 	if useTLS {
-		certPath := strings.TrimSpace(s.cfg.TLS.Cert)
-		keyPath := strings.TrimSpace(s.cfg.TLS.Key)
-		if certPath == "" || keyPath == "" {
-			if errClose := listener.Close(); errClose != nil {
-				log.Errorf("failed to close listener after TLS validation failure: %v", errClose)
-			}
-			return fmt.Errorf("failed to start HTTPS server: tls.cert or tls.key is empty")
-		}
-		certPair, errLoad := tls.LoadX509KeyPair(certPath, keyPath)
+		certPair, errLoad := loadServerTLSCertificate(s.cfg, s.configFilePath)
 		if errLoad != nil {
 			if errClose := listener.Close(); errClose != nil {
 				log.Errorf("failed to close listener after TLS key pair load failure: %v", errClose)

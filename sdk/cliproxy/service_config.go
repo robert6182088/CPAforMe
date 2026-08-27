@@ -189,6 +189,12 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 		return false
 	}
 	s.syncPluginModelRuntime(registrationCtx)
+	if errContext := ctx.Err(); errContext != nil {
+		return false
+	}
+	if !s.applyServerListenConfig(ctx, cfg) {
+		return false
+	}
 	return ctx.Err() == nil
 }
 

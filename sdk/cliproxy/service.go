@@ -68,6 +68,14 @@ type Service struct {
 	// serverErr channel for server startup/shutdown errors.
 	serverErr chan error
 
+	// serverLifecycleMu protects API server start/restart state.
+	serverLifecycleMu sync.Mutex
+	serverGeneration  uint64
+
+	// appliedServerListenState tracks listener-level configuration that requires
+	// an HTTP server restart when changed.
+	appliedServerListenState *serverListenState
+
 	// watcher handles file system monitoring.
 	watcher *WatcherWrapper
 
