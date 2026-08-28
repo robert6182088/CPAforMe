@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/tidwall/gjson"
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -756,6 +757,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				clearAuthStateOnSuccess(auth, now)
 			}
 		} else {
+			disableAuthForUsageLimit := isUsageLimitReachedResultError(result.Error)
 			if modelKey != "" {
 				if !shouldSkipCredentialCooldown(result.Error) {
 					disableCooling := m.cooldownDisabledForAuth(auth)
@@ -910,6 +912,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					disableCooling = false
 				}
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
+			}
+			if disableAuthForUsageLimit {
+				auth.Disabled = true
+				auth.Status = StatusDisabled
+				auth.Unavailable = true
+				m.deleteCallerExclusiveOwnerIfUnusedLocked(callerExclusiveAuthResourceKey(auth))
 			}
 		}
 
@@ -1342,6 +1350,25 @@ func resultErrorFromError(err error) *Error {
 		}
 	}
 	return resultErr
+}
+
+func isUsageLimitReachedResultError(resultErr *Error) bool {
+	if resultErr == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(resultErr.Code), "usage_limit_reached") {
+		return true
+	}
+	message := strings.TrimSpace(resultErr.Message)
+	if message == "" {
+		return false
+	}
+	for _, path := range []string{"error.type", "type", "body.error.type", "response.error.type"} {
+		if strings.EqualFold(strings.TrimSpace(gjson.Get(message, path).String()), "usage_limit_reached") {
+			return true
+		}
+	}
+	return false
 }
 
 // shouldSkipCredentialCooldown reports failures that must not mark auth/model cooling.
