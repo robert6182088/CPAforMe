@@ -35,16 +35,14 @@ var (
 )
 
 type authFileListOptions struct {
-	Name            string
-	AuthIndex       string
-	Status          string
-	ImportedFrom    time.Time
-	ImportedTo      time.Time
-	HasImportedFrom bool
-	HasImportedTo   bool
-	Limit           int
-	Offset          int
-	HasLimit        bool
+	Name           string
+	AuthIndex      string
+	Status         string
+	ExpiredDate    string
+	HasExpiredDate bool
+	Limit          int
+	Offset         int
+	HasLimit       bool
 }
 
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
@@ -106,6 +104,12 @@ func parseAuthFileListOptions(c *gin.Context) (authFileListOptions, error) {
 		AuthIndex: strings.TrimSpace(c.Query("auth_index")),
 		Status:    normalizeAuthFileStatusFilter(c.Query("status")),
 	}
+	expiredDate, hasExpiredDate, errExpiredDate := parseAuthFileListDate(c.Query("expired_date"))
+	if errExpiredDate != nil {
+		return opts, fmt.Errorf("expired_date is invalid")
+	}
+	opts.ExpiredDate = expiredDate
+	opts.HasExpiredDate = hasExpiredDate
 	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
 		limit, err := strconv.Atoi(raw)
 		if err != nil || limit < 1 {
@@ -124,31 +128,22 @@ func parseAuthFileListOptions(c *gin.Context) (authFileListOptions, error) {
 		}
 		opts.Offset = offset
 	}
-	from, hasFrom, errFrom := parseAuthFileListTime(firstAuthFileQuery(c, "imported_from", "created_from", "from", "imported_after"), false)
-	if errFrom != nil {
-		return opts, fmt.Errorf("imported_from is invalid")
-	}
-	to, hasTo, errTo := parseAuthFileListTime(firstAuthFileQuery(c, "imported_to", "created_to", "to", "imported_before"), true)
-	if errTo != nil {
-		return opts, fmt.Errorf("imported_to is invalid")
-	}
-	opts.ImportedFrom = from
-	opts.HasImportedFrom = hasFrom
-	opts.ImportedTo = to
-	opts.HasImportedTo = hasTo
 	return opts, nil
 }
 
-func firstAuthFileQuery(c *gin.Context, names ...string) string {
-	if c == nil {
-		return ""
+func parseAuthFileListDate(raw string) (string, bool, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false, nil
 	}
-	for _, name := range names {
-		if value := strings.TrimSpace(c.Query(name)); value != "" {
-			return value
-		}
+	if len(raw) != len("2006-01-02") {
+		return "", false, fmt.Errorf("invalid date")
 	}
-	return ""
+	parsed, errParse := time.ParseInLocation("2006-01-02", raw, time.Local)
+	if errParse != nil {
+		return "", false, errParse
+	}
+	return parsed.Format("2006-01-02"), true, nil
 }
 
 func parseAuthFileListTime(raw string, endOfDay bool) (time.Time, bool, error) {
@@ -237,44 +232,21 @@ func matchesAuthFileEntryOptions(entry gin.H, opts authFileListOptions) bool {
 	if !matchesAuthFileStatus(disabled, status, unavailable, statusMessage, opts.Status) {
 		return false
 	}
-	importedAt := authFileEntryImportedAt(entry)
-	if opts.HasImportedFrom && (importedAt.IsZero() || importedAt.Before(opts.ImportedFrom)) {
-		return false
-	}
-	if opts.HasImportedTo && (importedAt.IsZero() || importedAt.After(opts.ImportedTo)) {
+	if opts.HasExpiredDate && authFileEntryExpiredDate(entry) != opts.ExpiredDate {
 		return false
 	}
 	return true
 }
 
-func authFileEntryImportedAt(entry gin.H) time.Time {
-	for _, key := range []string{"created_at", "modtime", "updated_at"} {
+func authFileEntryExpiredDate(entry gin.H) string {
+	for _, key := range []string{"expired", "expire", "expires_at", "expiresAt", "expiry", "expires"} {
 		if value, ok := entry[key]; ok {
-			if ts, okParse := parseAuthFileEntryTime(value); okParse {
-				return ts
+			if date := authFileDatePart(value); date != "" {
+				return date
 			}
 		}
 	}
-	return time.Time{}
-}
-
-func parseAuthFileEntryTime(value any) (time.Time, bool) {
-	switch typed := value.(type) {
-	case time.Time:
-		return typed, !typed.IsZero()
-	case string:
-		parsed, ok, _ := parseAuthFileListTime(typed, false)
-		return parsed, ok
-	case int64:
-		if typed > 0 {
-			return time.Unix(typed, 0), true
-		}
-	case float64:
-		if typed > 0 {
-			return time.Unix(int64(typed), 0), true
-		}
-	}
-	return time.Time{}, false
+	return ""
 }
 
 func paginateAuths(auths []*coreauth.Auth, opts authFileListOptions) []*coreauth.Auth {
@@ -382,11 +354,7 @@ func matchesAuthFileListOptions(auth *coreauth.Auth, opts authFileListOptions) b
 	if !matchesAuthFileStatus(disabled, status, unavailable, statusMessage, opts.Status) {
 		return false
 	}
-	importedAt := authImportedAt(auth)
-	if opts.HasImportedFrom && (importedAt.IsZero() || importedAt.Before(opts.ImportedFrom)) {
-		return false
-	}
-	if opts.HasImportedTo && (importedAt.IsZero() || importedAt.After(opts.ImportedTo)) {
+	if opts.HasExpiredDate && authExpiredDate(auth) != opts.ExpiredDate {
 		return false
 	}
 	return true
@@ -409,22 +377,67 @@ func authDisabledStatus(auth *coreauth.Auth) (disabled bool, status string, unav
 	return auth.Disabled, strings.TrimSpace(string(auth.Status)), auth.Unavailable, strings.TrimSpace(auth.StatusMessage)
 }
 
-func authImportedAt(auth *coreauth.Auth) time.Time {
+func authExpiredDate(auth *coreauth.Auth) string {
 	if auth == nil {
-		return time.Time{}
+		return ""
 	}
-	if !auth.CreatedAt.IsZero() {
-		return auth.CreatedAt
-	}
-	if !auth.UpdatedAt.IsZero() {
-		return auth.UpdatedAt
-	}
-	if path := strings.TrimSpace(authAttribute(auth, "path")); path != "" {
-		if info, err := os.Stat(path); err == nil {
-			return info.ModTime()
+	if auth.Metadata != nil {
+		for _, key := range []string{"expired", "expire", "expires_at", "expiresAt", "expiry", "expires"} {
+			if value, ok := auth.Metadata[key]; ok {
+				if date := authFileDatePart(value); date != "" {
+					return date
+				}
+			}
 		}
 	}
-	return time.Time{}
+	if ts, ok := auth.ExpirationTime(); ok && !ts.IsZero() {
+		return ts.In(time.Local).Format("2006-01-02")
+	}
+	return ""
+}
+
+func authFileDatePart(value any) string {
+	switch typed := value.(type) {
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if len(trimmed) >= len("2006-01-02") {
+			candidate := trimmed[:len("2006-01-02")]
+			if _, errParse := time.ParseInLocation("2006-01-02", candidate, time.Local); errParse == nil {
+				return candidate
+			}
+		}
+		if parsed, ok, _ := parseAuthFileListTime(trimmed, false); ok {
+			return parsed.In(time.Local).Format("2006-01-02")
+		}
+	case time.Time:
+		if !typed.IsZero() {
+			return typed.In(time.Local).Format("2006-01-02")
+		}
+	case int64:
+		if typed > 0 {
+			return normalizeAuthFileUnix(typed).In(time.Local).Format("2006-01-02")
+		}
+	case int:
+		if typed > 0 {
+			return normalizeAuthFileUnix(int64(typed)).In(time.Local).Format("2006-01-02")
+		}
+	case float64:
+		if typed > 0 {
+			return normalizeAuthFileUnix(int64(typed)).In(time.Local).Format("2006-01-02")
+		}
+	case json.Number:
+		if parsed, errParse := typed.Int64(); errParse == nil && parsed > 0 {
+			return normalizeAuthFileUnix(parsed).In(time.Local).Format("2006-01-02")
+		}
+	}
+	return ""
+}
+
+func normalizeAuthFileUnix(raw int64) time.Time {
+	if raw > 1_000_000_000_000 {
+		return time.UnixMilli(raw)
+	}
+	return time.Unix(raw, 0)
 }
 
 func (h *Handler) lookupAuthFile(name string, authIndex string) (*coreauth.Auth, bool) {
@@ -539,6 +552,9 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, opts authFileListOptions
 				emailValue := gjson.GetBytes(data, "email").String()
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
+				if expired := strings.TrimSpace(gjson.GetBytes(data, "expired").String()); expired != "" {
+					fileData["expired"] = expired
+				}
 				if projectID := strings.TrimSpace(gjson.GetBytes(data, "project_id").String()); projectID != "" {
 					fileData["project_id"] = projectID
 				}
@@ -676,6 +692,9 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	if !auth.NextRetryAfter.IsZero() {
 		entry["next_retry_after"] = auth.NextRetryAfter
 	}
+	if expired := authExpiredValue(auth); expired != "" {
+		entry["expired"] = expired
+	}
 	if path != "" {
 		entry["path"] = path
 		entry["source"] = "file"
@@ -736,6 +755,44 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 		entry["request_retry"] = requestRetry
 	}
 	return entry
+}
+
+func authExpiredValue(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Metadata != nil {
+		for _, key := range []string{"expired", "expire", "expires_at", "expiresAt", "expiry", "expires"} {
+			if value, ok := auth.Metadata[key]; ok {
+				switch typed := value.(type) {
+				case string:
+					if trimmed := strings.TrimSpace(typed); trimmed != "" {
+						return trimmed
+					}
+				case json.Number:
+					if trimmed := strings.TrimSpace(typed.String()); trimmed != "" {
+						return trimmed
+					}
+				case float64:
+					if typed > 0 {
+						return normalizeAuthFileUnix(int64(typed)).Format(time.RFC3339)
+					}
+				case int64:
+					if typed > 0 {
+						return normalizeAuthFileUnix(typed).Format(time.RFC3339)
+					}
+				case int:
+					if typed > 0 {
+						return normalizeAuthFileUnix(int64(typed)).Format(time.RFC3339)
+					}
+				}
+			}
+		}
+	}
+	if ts, ok := auth.ExpirationTime(); ok && !ts.IsZero() {
+		return ts.Format(time.RFC3339)
+	}
+	return ""
 }
 
 func authFileRequestRetryFromJSON(data []byte) (int, bool) {

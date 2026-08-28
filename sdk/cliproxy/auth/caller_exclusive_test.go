@@ -181,6 +181,59 @@ func TestManagerCallerExclusiveAuthPrunesExpiredClaims(t *testing.T) {
 	}
 }
 
+func TestManagerCallerExclusiveAuthUsesConfiguredTTL(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := callerExclusiveTestAuth("auth-old", "old@example.com")
+	manager.auths = map[string]*Auth{
+		auth.ID: auth,
+	}
+	zhangsanScope := cliproxysession.CallerScope("sk-zhangsan")
+	manager.callerExclusiveAuthOwners = map[string]callerExclusiveOwnerRecord{
+		callerExclusiveAuthResourceKey(auth): {Owner: zhangsanScope, Sequence: 1, ClaimedAt: time.Now().Add(-2 * time.Hour)},
+	}
+
+	manager.SetConfig(&internalconfig.Config{
+		CallerExclusiveAuth: internalconfig.CallerExclusiveAuthConfig{TTL: "1h"},
+		SDKConfig: internalconfig.SDKConfig{
+			APIKeyEntries: []internalconfig.APIKeyEntry{{APIKey: "sk-zhangsan"}},
+		},
+	})
+
+	snapshot := manager.CallerAuthOccupancySnapshot([]string{zhangsanScope})
+	if items := snapshot[zhangsanScope]; len(items) != 0 {
+		t.Fatalf("items len = %d, want 0 after configured expiry: %#v", len(items), items)
+	}
+}
+
+func TestManagerCallerExclusiveAuthReleasesDisabledAuthClaimsOnUpdate(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.RegisterExecutor(schedulerTestExecutor{provider: "codex"})
+
+	auth := callerExclusiveTestAuth("auth-a", "same@example.com")
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("Register(auth-a) error = %v", err)
+	}
+
+	zhangsan := callerExclusiveTestOptions("sk-zhangsan")
+	if got, _, errPick := manager.pickNext(ctx, "codex", "", zhangsan, nil); errPick != nil || got == nil || got.ID != "auth-a" {
+		t.Fatalf("pickNext(zhangsan) = %#v, %v; want auth-a", got, errPick)
+	}
+
+	disabled := auth.Clone()
+	disabled.Disabled = true
+	disabled.Status = StatusDisabled
+	if _, errUpdate := manager.Update(ctx, disabled); errUpdate != nil {
+		t.Fatalf("Update(disabled) error = %v", errUpdate)
+	}
+
+	zhangsanScope := cliproxysession.CallerScope("sk-zhangsan")
+	snapshot := manager.CallerAuthOccupancySnapshot([]string{zhangsanScope})
+	if items := snapshot[zhangsanScope]; len(items) != 0 {
+		t.Fatalf("items len = %d, want 0 after auth disabled: %#v", len(items), items)
+	}
+}
+
 func TestManagerCallerExclusiveAuthRefreshesClaimTimeForSameOwner(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	auth := callerExclusiveTestAuth("auth-a", "a@example.com")

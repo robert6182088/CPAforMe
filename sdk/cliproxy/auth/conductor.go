@@ -132,8 +132,11 @@ type Manager struct {
 	homeSessionLocks      sync.Map
 	homeSessionAliases    homeSessionAliasCache
 	// callerExclusiveAuthOwners binds file-backed OAuth accounts to downstream API keys.
-	callerExclusiveAuthOwners map[string]callerExclusiveOwnerRecord
-	callerExclusiveAuthSeq    atomic.Uint64
+	callerExclusiveAuthOwners  map[string]callerExclusiveOwnerRecord
+	callerExclusiveAuthSeq     atomic.Uint64
+	callerExclusiveAuthTTL     atomic.Int64
+	callerExclusiveAuthStoreMu sync.RWMutex
+	callerExclusiveAuthStore   callerExclusiveOwnerStore
 	// callerActivity tracks the most recent request time for each downstream API key scope.
 	callerActivity map[string]time.Time
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
@@ -194,6 +197,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		providerOffsets:           make(map[string]int),
 		modelPoolOffsets:          make(map[string]int),
 	}
+	manager.callerExclusiveAuthTTL.Store(int64(72 * time.Hour))
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelRouting.Store(&apiKeyModelRoutingSnapshot{config: &internalconfig.Config{}})

@@ -87,6 +87,19 @@ pprof:
 #   max-string-bytes: 256
 #   staging-retention: 1m
 
+# Downstream API-key exclusive ownership of OAuth auth-file credentials.
+# TTL accepts Go-style durations, such as "72h", "24h", or "30m".
+# Redis is optional. When enabled, occupancy claims survive process restarts.
+caller-exclusive-auth:
+  ttl: "72h"
+  redis:
+    enabled: false
+    addr: "127.0.0.1:6379"
+    username: ""
+    password: ""
+    db: 0
+    key-prefix: "cliproxy:caller-exclusive-auth"
+
 # Standard dynamic library plugins are trusted in-process code. They are disabled by default.
 # Build Go examples with go build -buildmode=c-shared for the target GOOS/GOARCH.
 # Other languages can implement the same C ABI and JSON method protocol.

@@ -77,7 +77,7 @@ func TestListAuthFilesFiltersByNameAndAuthIndex(t *testing.T) {
 	}
 }
 
-func TestListAuthFilesPaginatesAndFiltersByImportTimeAndStatus(t *testing.T) {
+func TestListAuthFilesPaginatesAndFiltersByExpiredDateAndStatus(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 
 	authDir := t.TempDir()
@@ -87,14 +87,15 @@ func TestListAuthFilesPaginatesAndFiltersByImportTimeAndStatus(t *testing.T) {
 		fileName  string
 		createdAt time.Time
 		disabled  bool
+		expired   string
 	}{
-		{id: "auth-a", fileName: "alpha.json", createdAt: time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)},
-		{id: "auth-b", fileName: "beta.json", createdAt: time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC), disabled: true},
-		{id: "auth-c", fileName: "gamma.json", createdAt: time.Date(2026, 1, 3, 10, 0, 0, 0, time.UTC)},
+		{id: "auth-a", fileName: "alpha.json", createdAt: time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC), expired: "2026-01-01T15:04:05Z"},
+		{id: "auth-b", fileName: "beta.json", createdAt: time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC), disabled: true, expired: "2026-01-02T15:04:05Z"},
+		{id: "auth-c", fileName: "gamma.json", createdAt: time.Date(2026, 1, 3, 10, 0, 0, 0, time.UTC), expired: "2026-01-03T15:04:05Z"},
 	}
 	for _, record := range records {
 		filePath := filepath.Join(authDir, record.fileName)
-		if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex","expired":"`+record.expired+`"}`), 0o600); errWrite != nil {
 			t.Fatalf("failed to write auth file: %v", errWrite)
 		}
 		status := coreauth.StatusActive
@@ -110,6 +111,9 @@ func TestListAuthFilesPaginatesAndFiltersByImportTimeAndStatus(t *testing.T) {
 			CreatedAt: record.createdAt,
 			Attributes: map[string]string{
 				"path": filePath,
+			},
+			Metadata: map[string]any{
+				"expired": record.expired,
 			},
 		})
 	}
@@ -144,7 +148,7 @@ func TestListAuthFilesPaginatesAndFiltersByImportTimeAndStatus(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	ctx, _ = gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files?status=disabled&imported_from=2026-01-02&imported_to=2026-01-02", nil)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files?status=disabled&expired_date=2026-01-02", nil)
 
 	h.ListAuthFiles(ctx)
 

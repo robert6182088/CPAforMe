@@ -25,6 +25,9 @@ type Config struct {
 	// CredentialInFlight configures credential observation snapshots.
 	CredentialInFlight CredentialInFlightConfig `yaml:"credential-in-flight" json:"credential-in-flight"`
 
+	// CallerExclusiveAuth controls downstream API-key exclusive ownership of OAuth credentials.
+	CallerExclusiveAuth CallerExclusiveAuthConfig `yaml:"caller-exclusive-auth" json:"caller-exclusive-auth"`
+
 	// RemoteManagement nests management-related options under 'remote-management'.
 	RemoteManagement RemoteManagement `yaml:"remote-management" json:"-"`
 

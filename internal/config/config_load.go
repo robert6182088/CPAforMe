@@ -37,6 +37,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 			if os.IsNotExist(err) || errors.Is(err, syscall.EISDIR) {
 				// Missing and optional: return empty config (cloud deploy standby).
 				cfg := &Config{CredentialInFlight: DefaultCredentialInFlightConfig()}
+				cfg.CallerExclusiveAuth = DefaultCallerExclusiveAuthConfig()
 				cfg.NormalizePluginsConfig()
 				return cfg, nil
 			}
@@ -47,6 +48,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// In cloud deploy mode (optional=true), if file is empty or contains only whitespace, return empty config.
 	if optional && len(bytes.TrimSpace(data)) == 0 {
 		cfg := &Config{CredentialInFlight: DefaultCredentialInFlightConfig()}
+		cfg.CallerExclusiveAuth = DefaultCallerExclusiveAuthConfig()
 		cfg.NormalizePluginsConfig()
 		return cfg, nil
 	}
@@ -54,6 +56,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if errValidate := validateCredentialWeightYAML(data); errValidate != nil {
 		if optional {
 			cfgOptional := &Config{CredentialInFlight: DefaultCredentialInFlightConfig()}
+			cfgOptional.CallerExclusiveAuth = DefaultCallerExclusiveAuthConfig()
 			cfgOptional.NormalizePluginsConfig()
 			return cfgOptional, nil
 		}
@@ -78,10 +81,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	cfg.CredentialInFlight = DefaultCredentialInFlightConfig()
+	cfg.CallerExclusiveAuth = DefaultCallerExclusiveAuthConfig()
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
 			cfgOptional := &Config{CredentialInFlight: DefaultCredentialInFlightConfig()}
+			cfgOptional.CallerExclusiveAuth = DefaultCallerExclusiveAuthConfig()
 			cfgOptional.NormalizePluginsConfig()
 			return cfgOptional, nil
 		}
@@ -89,6 +94,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 
 	cfg.CredentialConcurrency = cfg.CredentialConcurrency.WithDefaults()
+	cfg.CallerExclusiveAuth = cfg.CallerExclusiveAuth.WithDefaults()
 	if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
 		return nil, errValidate
 	}
